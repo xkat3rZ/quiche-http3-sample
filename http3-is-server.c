@@ -74,21 +74,64 @@
 #define CERT_FILE "./cert-quic-chain.crt"
 #define KEY_FILE  "./cert-quic.key"
 
-// HTML response served when the client connects via HTTP/2 (TCP).
-static const char HTTP2_RESPONSE[] =
-    "<!DOCTYPE html>\n"
-    "<html>\n"
-    "<head><title>Not HTTP/3</title></head>\n"
-    "<body>\n"
-    "<h1>HTTP/3 was not used to request this page.</h1>\n"
-    "<p>By visiting this page, your client might have learned that "
-    "HTTP/3 is available.</p>\n"
-    "<p><a href=\"/\">Try reloading?</a></p>\n"
-    "</body>\n"
-    "</html>";
+// If 1, the TCP landing page auto-refreshes after 3 seconds, triggering
+// an HTTP/3 connection to download the file. If 0, the user must
+// manually click the link.
+#define DEBUG_FILE 1
 
 // File to serve over HTTP/3.
 #define FILE_PATH "./hello.txt"
+
+// HTML response for the TCP landing page when DEBUG_FILE is enabled.
+// Auto-refreshes to /hello.txt after 3 seconds via HTTP/3.
+static const char HTTP2_RESPONSE_AUTO[] =
+    "<!DOCTYPE html>\n"
+    "<html>\n"
+    "<head>\n"
+    "<title>HTTP/3 Download</title>\n"
+    "<meta http-equiv=\"refresh\" content=\"3;url=https://127.0.0.1:4433/hello.txt\">\n"
+    "</head>\n"
+    "<body>\n"
+    "<h1>HTTP/3 Download</h1>\n"
+    "<p>Downloading file via HTTP/3 in 3 seconds...</p>\n"
+    "</body>\n"
+    "</html>";
+
+// HTML response for the TCP landing page when DEBUG_FILE is disabled.
+// User must manually click the link.
+static const char HTTP2_RESPONSE_MANUAL[] =
+    "<!DOCTYPE html>\n"
+    "<html>\n"
+    "<head><title>HTTP/3 Download</title></head>\n"
+    "<body>\n"
+    "<h1>HTTP/3 Download</h1>\n"
+    "<p><a href=\"https://127.0.0.1:4433/hello.txt\">Click to download "
+    "file via HTTP/3</a></p>\n"
+    "</body>\n"
+    "</html>";
+
+// HTML served over HTTP/3 at / when DEBUG_FILE is enabled.
+static const char H3_LANDING_AUTO[] =
+    "<!DOCTYPE html>\n"
+    "<html>\n"
+    "<head>\n"
+    "<meta http-equiv=\"refresh\" content=\"3;url=/hello.txt\">\n"
+    "</head>\n"
+    "<body>\n"
+    "<h1>HTTP/3 Connected</h1>\n"
+    "<p>Downloading file in 3 seconds...</p>\n"
+    "</body>\n"
+    "</html>";
+
+// HTML served over HTTP/3 at / when DEBUG_FILE is disabled.
+static const char H3_LANDING_MANUAL[] =
+    "<!DOCTYPE html>\n"
+    "<html>\n"
+    "<body>\n"
+    "<h1>HTTP/3 Connected</h1>\n"
+    "<p><a href=\"/hello.txt\">Download file</a></p>\n"
+    "</body>\n"
+    "</html>";
 
 // Global buffer to hold the file content.
 static uint8_t *file_content = NULL;
@@ -334,17 +377,52 @@ static int for_each_header(uint8_t *name, size_t name_len,
     return 0;
 }
 
+// Extract the :path pseudo-header from an HTTP/3 event.
+static int for_each_header_path(uint8_t *name, size_t name_len,
+                                uint8_t *value, size_t value_len,
+                                void *argp) {
+    if (name_len == 5 && memcmp(name, ":path", 5) == 0) {
+        char **path = (char **) argp;
+        *path = strndup((const char *) value, value_len);
+    }
+
+    return 0;
+}
+
 // Handle an incoming HTTP/3 request by sending a response with Alt-Svc.
 static void handle_request(struct conn_io *conn_io, int64_t stream_id,
                            quiche_h3_event *ev) {
     quiche_h3_event_for_each_header(ev, for_each_header, NULL);
 
+    // Extract the request path.
+    char *path = NULL;
+    quiche_h3_event_for_each_header(ev, for_each_header_path, &path);
+
     // Stop reading the request stream since we only need headers.
     quiche_conn_stream_shutdown(conn_io->conn, stream_id,
                                 QUICHE_SHUTDOWN_READ, 0);
 
-    const uint8_t *body = file_content;
-    size_t body_len = file_content_len;
+    // Serve landing page HTML on /, file content on any other path.
+    const uint8_t *body;
+    size_t body_len;
+    const char *content_type;
+
+    if (path == NULL || strcmp(path, "/") == 0) {
+        if (DEBUG_FILE) {
+            body = (const uint8_t *) H3_LANDING_AUTO;
+            body_len = sizeof(H3_LANDING_AUTO) - 1;
+        } else {
+            body = (const uint8_t *) H3_LANDING_MANUAL;
+            body_len = sizeof(H3_LANDING_MANUAL) - 1;
+        }
+        content_type = "text/html";
+    } else {
+        body = file_content;
+        body_len = file_content_len;
+        content_type = "application/octet-stream";
+    }
+
+    free(path);
 
     char content_length[32];
     snprintf(content_length, sizeof(content_length), "%zu", body_len);
@@ -365,20 +443,14 @@ static void handle_request(struct conn_io *conn_io, int64_t stream_id,
         {
             .name = (const uint8_t *) "content-type",
             .name_len = sizeof("content-type") - 1,
-            .value = (const uint8_t *) "application/octet-stream",
-            .value_len = sizeof("application/octet-stream") - 1,
+            .value = (const uint8_t *) content_type,
+            .value_len = strlen(content_type),
         },
         {
             .name = (const uint8_t *) "content-length",
             .name_len = sizeof("content-length") - 1,
             .value = (const uint8_t *) content_length,
             .value_len = strlen(content_length),
-        },
-        {
-            .name = (const uint8_t *) "content-disposition",
-            .name_len = sizeof("content-disposition") - 1,
-            .value = (const uint8_t *) "attachment; filename=\"hello.txt\"",
-            .value_len = sizeof("attachment; filename=\"hello.txt\"") - 1,
         },
         {
             .name = (const uint8_t *) "alt-svc",
@@ -390,7 +462,7 @@ static void handle_request(struct conn_io *conn_io, int64_t stream_id,
 
     // Send response headers.
     int rc = quiche_h3_send_response(conn_io->http3, conn_io->conn,
-                                     stream_id, headers, 6, false);
+                                     stream_id, headers, 5, false);
 
     if (rc == QUICHE_H3_ERR_STREAM_BLOCKED) {
         // Stream blocked - save partial response for later.
@@ -469,7 +541,7 @@ static void handle_writable(struct conn_io *conn_io, uint64_t stream_id) {
 
     // Send headers if they haven't been sent yet.
     if (!resp->headers_sent) {
-        size_t body_len = file_content_len;
+        size_t body_len = resp->body_len;
 
         char content_length[32];
         snprintf(content_length, sizeof(content_length), "%zu", body_len);
@@ -500,12 +572,6 @@ static void handle_writable(struct conn_io *conn_io, uint64_t stream_id) {
                 .value_len = strlen(content_length),
             },
             {
-                .name = (const uint8_t *) "content-disposition",
-                .name_len = sizeof("content-disposition") - 1,
-                .value = (const uint8_t *) "attachment; filename=\"hello.txt\"",
-                .value_len = sizeof("attachment; filename=\"hello.txt\"") - 1,
-            },
-            {
                 .name = (const uint8_t *) "alt-svc",
                 .name_len = sizeof("alt-svc") - 1,
                 .value = (const uint8_t *) ALT_SVC_VALUE,
@@ -514,7 +580,7 @@ static void handle_writable(struct conn_io *conn_io, uint64_t stream_id) {
         };
 
         int rc = quiche_h3_send_response(conn_io->http3, conn_io->conn,
-                                         stream_id, headers, 6, false);
+                                         stream_id, headers, 5, false);
 
         if (rc == QUICHE_H3_ERR_STREAM_BLOCKED) {
             return;
@@ -878,7 +944,7 @@ static void handle_http11_connection(SSL *ssl) {
     fprintf(stderr, "H1: received request:\n%s\n", request);
 
     // Build HTTP/1.1 response with Alt-Svc header.
-    const char *body = HTTP2_RESPONSE;
+    const char *body = DEBUG_FILE ? HTTP2_RESPONSE_AUTO : HTTP2_RESPONSE_MANUAL;
     size_t body_len = strlen(body);
 
     char response[8192];
@@ -1069,7 +1135,7 @@ static void handle_http2_connection(SSL_CTX *ssl_ctx, int client_fd) {
     }
 
     // Build the response body.
-    const char *body = HTTP2_RESPONSE;
+    const char *body = DEBUG_FILE ? HTTP2_RESPONSE_AUTO : HTTP2_RESPONSE_MANUAL;
     size_t body_len = strlen(body);
 
     char body_len_str[32];
