@@ -87,16 +87,52 @@ static const char HTTP2_RESPONSE[] =
     "</body>\n"
     "</html>";
 
-// HTML response served when the client connects via HTTP/3 (QUIC).
-static const char HTTP3_RESPONSE[] =
-    "<!DOCTYPE html>\n"
-    "<html>\n"
-    "<head><title>HTTP/3!</title></head>\n"
-    "<body>\n"
-    "<h1>HTTP/3! Success!</h1>\n"
-    "<p>This page was served over HTTP/3.</p>\n"
-    "</body>\n"
-    "</html>";
+// File to serve over HTTP/3.
+#define FILE_PATH "./hello.txt"
+
+// Global buffer to hold the file content.
+static uint8_t *file_content = NULL;
+static size_t file_content_len = 0;
+
+// Load file content into memory.
+static bool load_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        fprintf(stderr, "failed to open file: %s\n", path);
+        return false;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size <= 0) {
+        fprintf(stderr, "file is empty or error: %s\n", path);
+        fclose(f);
+        return false;
+    }
+
+    file_content = malloc((size_t) size);
+    if (file_content == NULL) {
+        fprintf(stderr, "failed to allocate memory for file\n");
+        fclose(f);
+        return false;
+    }
+
+    size_t read = fread(file_content, 1, (size_t) size, f);
+    fclose(f);
+
+    if (read != (size_t) size) {
+        fprintf(stderr, "failed to read entire file\n");
+        free(file_content);
+        file_content = NULL;
+        return false;
+    }
+
+    file_content_len = (size_t) size;
+    fprintf(stderr, "loaded %zu bytes from %s\n", file_content_len, path);
+    return true;
+}
 
 // Alt-Svc header value advertising HTTP/3 on port 4433.
 #define ALT_SVC_VALUE "h3=\":4433\"; ma=86400; persist=1"
@@ -307,8 +343,8 @@ static void handle_request(struct conn_io *conn_io, int64_t stream_id,
     quiche_conn_stream_shutdown(conn_io->conn, stream_id,
                                 QUICHE_SHUTDOWN_READ, 0);
 
-    const uint8_t *body = (const uint8_t *) HTTP3_RESPONSE;
-    size_t body_len = sizeof(HTTP3_RESPONSE) - 1;
+    const uint8_t *body = file_content;
+    size_t body_len = file_content_len;
 
     char content_length[32];
     snprintf(content_length, sizeof(content_length), "%zu", body_len);
@@ -329,14 +365,20 @@ static void handle_request(struct conn_io *conn_io, int64_t stream_id,
         {
             .name = (const uint8_t *) "content-type",
             .name_len = sizeof("content-type") - 1,
-            .value = (const uint8_t *) "text/html",
-            .value_len = sizeof("text/html") - 1,
+            .value = (const uint8_t *) "application/octet-stream",
+            .value_len = sizeof("application/octet-stream") - 1,
         },
         {
             .name = (const uint8_t *) "content-length",
             .name_len = sizeof("content-length") - 1,
             .value = (const uint8_t *) content_length,
             .value_len = strlen(content_length),
+        },
+        {
+            .name = (const uint8_t *) "content-disposition",
+            .name_len = sizeof("content-disposition") - 1,
+            .value = (const uint8_t *) "attachment; filename=\"hello.txt\"",
+            .value_len = sizeof("attachment; filename=\"hello.txt\"") - 1,
         },
         {
             .name = (const uint8_t *) "alt-svc",
@@ -348,7 +390,7 @@ static void handle_request(struct conn_io *conn_io, int64_t stream_id,
 
     // Send response headers.
     int rc = quiche_h3_send_response(conn_io->http3, conn_io->conn,
-                                     stream_id, headers, 5, false);
+                                     stream_id, headers, 6, false);
 
     if (rc == QUICHE_H3_ERR_STREAM_BLOCKED) {
         // Stream blocked - save partial response for later.
@@ -427,7 +469,7 @@ static void handle_writable(struct conn_io *conn_io, uint64_t stream_id) {
 
     // Send headers if they haven't been sent yet.
     if (!resp->headers_sent) {
-        size_t body_len = sizeof(HTTP3_RESPONSE) - 1;
+        size_t body_len = file_content_len;
 
         char content_length[32];
         snprintf(content_length, sizeof(content_length), "%zu", body_len);
@@ -448,14 +490,20 @@ static void handle_writable(struct conn_io *conn_io, uint64_t stream_id) {
             {
                 .name = (const uint8_t *) "content-type",
                 .name_len = sizeof("content-type") - 1,
-                .value = (const uint8_t *) "text/html",
-                .value_len = sizeof("text/html") - 1,
+                .value = (const uint8_t *) "application/octet-stream",
+                .value_len = sizeof("application/octet-stream") - 1,
             },
             {
                 .name = (const uint8_t *) "content-length",
                 .name_len = sizeof("content-length") - 1,
                 .value = (const uint8_t *) content_length,
                 .value_len = strlen(content_length),
+            },
+            {
+                .name = (const uint8_t *) "content-disposition",
+                .name_len = sizeof("content-disposition") - 1,
+                .value = (const uint8_t *) "attachment; filename=\"hello.txt\"",
+                .value_len = sizeof("attachment; filename=\"hello.txt\"") - 1,
             },
             {
                 .name = (const uint8_t *) "alt-svc",
@@ -466,7 +514,7 @@ static void handle_writable(struct conn_io *conn_io, uint64_t stream_id) {
         };
 
         int rc = quiche_h3_send_response(conn_io->http3, conn_io->conn,
-                                         stream_id, headers, 5, false);
+                                         stream_id, headers, 6, false);
 
         if (rc == QUICHE_H3_ERR_STREAM_BLOCKED) {
             return;
@@ -1261,6 +1309,12 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    // Load the file to serve over HTTP/3.
+    if (!load_file(FILE_PATH)) {
+        fprintf(stderr, "failed to load %s\n", FILE_PATH);
+        return -1;
+    }
+
     // Ignore SIGPIPE to avoid crashes from broken TCP connections.
     signal(SIGPIPE, SIG_IGN);
 
@@ -1366,6 +1420,8 @@ int main(int argc, char *argv[]) {
 
     quiche_h3_config_free(http3_config);
     quiche_config_free(config);
+
+    free(file_content);
 
     return 0;
 }
