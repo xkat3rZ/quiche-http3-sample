@@ -68,16 +68,23 @@
     sizeof(struct sockaddr_storage) + \
     QUICHE_MAX_CONN_ID_LEN
 
-#define LISTEN_HOST "127.0.0.1"
+#define LISTEN_HOST "quic.local"
 #define LISTEN_PORT "4433"
 
 #define CERT_FILE "./cert-quic-chain.crt"
 #define KEY_FILE  "./cert-quic.key"
 
+#define QUICHE_H3_APPLICATION_PROTOCOL_CUSTOM "\x05h3-29"
+// #define QUICHE_H3_APPLICATION_PROTOCOL_CUSTOM "\x02h3"
+
+// #define QUICHE_PROTOCOL_VERSION_CUSTOM 0x00000001
+// #define QUICHE_PROTOCOL_VERSION_CUSTOM 0x00000002
+#define QUICHE_PROTOCOL_VERSION_CUSTOM 0xff00001d
+
 // If 1, the TCP landing page auto-refreshes after 3 seconds, triggering
 // an HTTP/3 connection to download the file. If 0, the user must
 // manually click the link.
-#define DEBUG_FILE 1
+#define DEBUG_FILE 0
 
 // File to serve over HTTP/3.
 #define FILE_PATH "./hello.txt"
@@ -89,7 +96,7 @@ static const char HTTP2_RESPONSE_AUTO[] =
     "<html>\n"
     "<head>\n"
     "<title>HTTP/3 Download</title>\n"
-    "<meta http-equiv=\"refresh\" content=\"3;url=https://127.0.0.1:4433/hello.txt\">\n"
+    "<meta http-equiv=\"refresh\" content=\"3;url=https://quic.local:4433/hello.txt\">\n"
     "</head>\n"
     "<body>\n"
     "<h1>HTTP/3 Download</h1>\n"
@@ -105,7 +112,7 @@ static const char HTTP2_RESPONSE_MANUAL[] =
     "<head><title>HTTP/3 Download</title></head>\n"
     "<body>\n"
     "<h1>HTTP/3 Download</h1>\n"
-    "<p><a href=\"https://127.0.0.1:4433/hello.txt\">Click to download "
+    "<p><a href=\"https://quic.local:4433/hello.txt\">Click to download "
     "file via HTTP/3</a></p>\n"
     "</body>\n"
     "</html>";
@@ -495,7 +502,8 @@ static void handle_request(struct conn_io *conn_io, int64_t stream_id,
 
     // Send response body.
     ssize_t written = quiche_h3_send_body(conn_io->http3, conn_io->conn,
-                                          stream_id, body, body_len, true);
+                                          stream_id, (uint8_t *) body,
+                                          body_len, true);
 
     if (written == QUICHE_H3_ERR_DONE || written == 0) {
         written = 0;
@@ -602,7 +610,7 @@ static void handle_writable(struct conn_io *conn_io, uint64_t stream_id) {
     size_t remaining_len = resp->body_len - resp->written;
 
     ssize_t written = quiche_h3_send_body(conn_io->http3, conn_io->conn,
-                                          stream_id, remaining,
+                                          stream_id, (uint8_t *) remaining,
                                           remaining_len, true);
 
     if (written == QUICHE_H3_ERR_DONE) {
@@ -821,6 +829,9 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
                     case QUICHE_H3_EVENT_PRIORITY_UPDATE:
                         break;
 
+                    case QUICHE_H3_EVENT_DATAGRAM:
+                        break;
+
                     case QUICHE_H3_EVENT_GOAWAY: {
                         fprintf(stderr, "got GOAWAY\n");
                         break;
@@ -853,7 +864,9 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
             ev_timer_stop(loop, &conn_io->timer);
 
             free_partial_responses(conn_io);
-            quiche_h3_conn_free(conn_io->http3);
+            if (conn_io->http3 != NULL) {
+                quiche_h3_conn_free(conn_io->http3);
+            }
             quiche_conn_free(conn_io->conn);
             free(conn_io);
         }
@@ -886,7 +899,9 @@ static void timeout_cb(EV_P_ ev_timer *w, int revents) {
         ev_timer_stop(loop, &conn_io->timer);
 
         free_partial_responses(conn_io);
-        quiche_h3_conn_free(conn_io->http3);
+        if (conn_io->http3 != NULL) {
+            quiche_h3_conn_free(conn_io->http3);
+        }
         quiche_conn_free(conn_io->conn);
         free(conn_io);
 
@@ -1431,7 +1446,7 @@ int main(int argc, char *argv[]) {
             LISTEN_HOST, LISTEN_PORT);
 
     // Create the QUIC configuration.
-    config = quiche_config_new(QUICHE_PROTOCOL_VERSION);
+    config = quiche_config_new(QUICHE_PROTOCOL_VERSION_CUSTOM);
     if (config == NULL) {
         fprintf(stderr, "failed to create config\n");
         return -1;
@@ -1441,8 +1456,8 @@ int main(int argc, char *argv[]) {
     quiche_config_load_priv_key_from_pem_file(config, KEY_FILE);
 
     quiche_config_set_application_protos(config,
-        (uint8_t *) QUICHE_H3_APPLICATION_PROTOCOL,
-        sizeof(QUICHE_H3_APPLICATION_PROTOCOL) - 1);
+        (uint8_t *) QUICHE_H3_APPLICATION_PROTOCOL_CUSTOM,
+        sizeof(QUICHE_H3_APPLICATION_PROTOCOL_CUSTOM) - 1);
 
     quiche_config_set_max_idle_timeout(config, 5000);
     quiche_config_set_max_recv_udp_payload_size(config, MAX_DATAGRAM_SIZE);
